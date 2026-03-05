@@ -59,6 +59,12 @@ func (s *Server) Store() *store.Store {
 	return s.store
 }
 
+// DispatchCommand dispatches a command through the router.
+// Used by AOF replay to re-execute persisted commands on startup.
+func (s *Server) DispatchCommand(args []resp.Value) resp.Value {
+	return s.router.Dispatch(args)
+}
+
 // SetAOFWriter sets the AOF persistence writer. Must be called before Start.
 func (s *Server) SetAOFWriter(w AOFWriter) {
 	s.aofWriter = w

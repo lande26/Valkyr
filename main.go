@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	valkyrAOF "github.com/kartik/valkyr/aof"
 	"github.com/kartik/valkyr/config"
 	"github.com/kartik/valkyr/server"
 )
@@ -37,8 +38,29 @@ func main() {
 	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})
 	slog.SetDefault(slog.New(handler))
 
-	// Create and start server
+	// Create server
 	srv := server.NewServer(cfg)
+
+	// Initialize AOF persistence (if enabled)
+	var aofFile *valkyrAOF.AOF
+	if !cfg.NoPersist {
+		aofFile, err = valkyrAOF.New(cfg.AOFPath)
+		if err != nil {
+			slog.Error("Failed to open AOF file", "err", err)
+			os.Exit(1)
+		}
+
+		// Replay AOF to restore state (AOF writer is NOT set yet,
+		// so replayed commands won't be re-logged to the file)
+		if err := aofFile.Replay(srv.DispatchCommand); err != nil {
+			slog.Error("AOF replay failed", "err", err)
+			os.Exit(1)
+		}
+
+		// NOW set the AOF writer so future commands get logged
+		srv.SetAOFWriter(aofFile)
+		slog.Info("AOF persistence enabled", "path", cfg.AOFPath)
+	}
 
 	// Handle graceful shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -46,6 +68,15 @@ func main() {
 	go func() {
 		sig := <-sigCh
 		slog.Info("Received signal, shutting down...", "signal", sig)
+
+		// Flush AOF before shutting down
+		if aofFile != nil {
+			if err := aofFile.Close(); err != nil {
+				slog.Error("AOF close failed", "err", err)
+			}
+			slog.Info("AOF flushed to disk")
+		}
+
 		srv.Shutdown()
 		os.Exit(0)
 	}()
