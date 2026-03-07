@@ -23,7 +23,7 @@ A Redis clone built without any Redis libraries. Just raw TCP, Go's concurrency 
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/valkyr.git
+git clone https://github.com/lande26/valkyr.git
 cd valkyr
 make build
 ```
