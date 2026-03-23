@@ -129,6 +129,7 @@ func (r *Router) registerAll() {
 	r.handlers["DBSIZE"] = r.cmdDBSize
 	r.handlers["FLUSHDB"] = r.cmdFlushDB
 	r.handlers["INFO"] = r.cmdInfo
+	r.handlers["BGSAVE"] = r.cmdBGSave
 }
 
 // ───────────────────────── Connection Commands ─────────────────────────
@@ -973,6 +974,14 @@ func (r *Router) cmdFlushDB(args []resp.Value) resp.Value {
 // cmdInfo handles INFO [section]
 func (r *Router) cmdInfo(args []resp.Value) resp.Value {
 	return resp.BulkStringValue(r.server.Info())
+}
+
+// cmdBGSave handles BGSAVE — flushes the AOF buffer and fsyncs to disk.
+func (r *Router) cmdBGSave(args []resp.Value) resp.Value {
+	if err := r.server.SyncAOF(); err != nil {
+		return resp.ErrorValue("ERR " + err.Error())
+	}
+	return resp.SimpleStringValue("Background saving started")
 }
 
 // matchGlob implements a simple glob pattern matcher supporting * and ?.

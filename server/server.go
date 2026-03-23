@@ -79,6 +79,18 @@ func (s *Server) LogToAOF(args []resp.Value) {
 	}
 }
 
+// SyncAOF flushes the AOF buffer and fsyncs to disk.
+// Returns an error if persistence is not enabled or the sync fails.
+func (s *Server) SyncAOF() error {
+	if s.aofWriter == nil {
+		return fmt.Errorf("persistence is disabled")
+	}
+	if syncer, ok := s.aofWriter.(interface{ Sync() error }); ok {
+		return syncer.Sync()
+	}
+	return fmt.Errorf("AOF writer does not support sync")
+}
+
 // Start begins listening for TCP connections and starts the TTL sweeper.
 // It blocks until the server is shut down.
 func (s *Server) Start() error {
