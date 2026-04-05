@@ -137,6 +137,14 @@ func (t *TTLStore) ExpiresCount() int {
 	return len(t.deadlines)
 }
 
+// Exists checks if a key has a TTL deadline.
+func (t *TTLStore) Exists(key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.deadlines[key]
+	return ok
+}
+
 // Flush removes all TTL entries.
 func (t *TTLStore) Flush() {
 	t.mu.Lock()
