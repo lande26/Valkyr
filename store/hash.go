@@ -1,6 +1,8 @@
 package store
 
 import (
+	"fmt"
+	"strconv"
 	"sync"
 )
 
@@ -57,7 +59,6 @@ func (s *HashStore) HGetAll(key string) map[string]string {
 	if !ok {
 		return nil
 	}
-	// Return a copy to avoid data races on the caller side
 	result := make(map[string]string, len(h))
 	for k, v := range h {
 		result[k] = v
@@ -81,7 +82,6 @@ func (s *HashStore) HDel(key string, fields []string) int {
 			removed++
 		}
 	}
-	// Auto-delete empty hashes
 	if len(h) == 0 {
 		delete(s.data, key)
 	}
@@ -166,7 +166,6 @@ func (s *HashStore) GetRaw(key string) (map[string]string, bool) {
 	if !ok {
 		return nil, false
 	}
-	// Return a copy
 	cp := make(map[string]string, len(h))
 	for k, v := range h {
 		cp[k] = v
@@ -205,4 +204,87 @@ func (s *HashStore) Flush() {
 	s.mu.Lock()
 	s.data = make(map[string]map[string]string)
 	s.mu.Unlock()
+}
+
+// HIncrBy increments the integer value of a hash field by the given increment.
+// If the key or field does not exist, it is set to 0 before executing the operation.
+func (s *HashStore) HIncrBy(key, field string, increment int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.data[key]; !ok {
+		s.data[key] = make(map[string]string)
+	}
+
+	valStr, ok := s.data[key][field]
+	var val int64
+	if ok {
+		var err error
+		val, err = strconv.ParseInt(valStr, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("ERR hash value is not an integer")
+		}
+	}
+
+	val += increment
+	s.data[key][field] = strconv.FormatInt(val, 10)
+	return val, nil
+}
+
+// HIncrByFloat increments the float value of a hash field by the given increment.
+// If the key or field does not exist, it is set to 0 before executing the operation.
+func (s *HashStore) HIncrByFloat(key, field string, increment float64) (float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.data[key]; !ok {
+		s.data[key] = make(map[string]string)
+	}
+
+	valStr, ok := s.data[key][field]
+	var val float64
+	if ok {
+		var err error
+		val, err = strconv.ParseFloat(valStr, 64)
+		if err != nil {
+			return 0, fmt.Errorf("ERR hash value is not a valid float")
+		}
+	}
+
+	val += increment
+	s.data[key][field] = fmt.Sprintf("%g", val)
+	return val, nil
+}
+
+// HVals returns all values in the hash stored at key.
+func (s *HashStore) HVals(key string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	h, ok := s.data[key]
+	if !ok {
+		return []string{}
+	}
+	vals := make([]string, 0, len(h))
+	for _, v := range h {
+		vals = append(vals, v)
+	}
+	return vals
+}
+
+// HStrLen returns the string length of the value associated with field in the hash stored at key.
+// If the key or field does not exist, 0 is returned.
+func (s *HashStore) HStrLen(key, field string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	h, ok := s.data[key]
+	if !ok {
+		return 0
+	}
+	val, ok := h[field]
+	if !ok {
+		return 0
+	}
+	return len(val)
 }

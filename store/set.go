@@ -1,6 +1,7 @@
 package store
 
 import (
+	"math/rand"
 	"sync"
 )
 
@@ -52,7 +53,6 @@ func (s *SetStore) SRem(key string, members []string) int {
 			removed++
 		}
 	}
-	// Auto-delete empty sets
 	if len(set) == 0 {
 		delete(s.data, key)
 	}
@@ -94,7 +94,6 @@ func (s *SetStore) SCard(key string) int {
 }
 
 // SInter returns the intersection of all specified sets.
-// If any key does not exist, the result is an empty set.
 func (s *SetStore) SInter(keys []string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -102,7 +101,6 @@ func (s *SetStore) SInter(keys []string) []string {
 		return []string{}
 	}
 
-	// Start with the first set
 	first, ok := s.data[keys[0]]
 	if !ok {
 		return []string{}
@@ -246,4 +244,97 @@ func (s *SetStore) Flush() {
 	s.mu.Lock()
 	s.data = make(map[string]map[string]struct{})
 	s.mu.Unlock()
+}
+
+// SPop removes and returns one or more random elements from the set stored at key.
+func (s *SetStore) SPop(key string, count int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	set, ok := s.data[key]
+	if !ok || len(set) == 0 {
+		return nil
+	}
+
+	if count > len(set) {
+		count = len(set)
+	}
+
+	result := make([]string, 0, count)
+	for member := range set {
+		if len(result) >= count {
+			break
+		}
+		result = append(result, member)
+		delete(set, member)
+	}
+
+	if len(set) == 0 {
+		delete(s.data, key)
+	}
+	return result
+}
+
+// SRandMember returns one or more random elements from the set stored at key (without removing them).
+func (s *SetStore) SRandMember(key string, count int) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	set, ok := s.data[key]
+	if !ok || len(set) == 0 || count == 0 {
+		return nil
+	}
+
+	members := make([]string, 0, len(set))
+	for m := range set {
+		members = append(members, m)
+	}
+
+	if count == 1 || count == -1 {
+		return []string{members[rand.Intn(len(members))]}
+	}
+
+	if count > 0 {
+		if count > len(members) {
+			count = len(members)
+		}
+		rand.Shuffle(len(members), func(i, j int) {
+			members[i], members[j] = members[j], members[i]
+		})
+		return members[:count]
+	}
+
+	absCount := -count
+	result := make([]string, absCount)
+	for i := 0; i < absCount; i++ {
+		result[i] = members[rand.Intn(len(members))]
+	}
+	return result
+}
+
+// SMove moves member from source to destination set.
+func (s *SetStore) SMove(source, destination, member string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	srcSet, ok := s.data[source]
+	if !ok {
+		return false
+	}
+	if _, exists := srcSet[member]; !exists {
+		return false
+	}
+
+	delete(srcSet, member)
+	if len(srcSet) == 0 {
+		delete(s.data, source)
+	}
+
+	destSet, ok := s.data[destination]
+	if !ok {
+		destSet = make(map[string]struct{})
+		s.data[destination] = destSet
+	}
+	destSet[member] = struct{}{}
+	return true
 }

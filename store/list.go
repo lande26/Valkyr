@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"sync"
 )
 
@@ -28,7 +29,6 @@ func (s *ListStore) LPush(key string, values []string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	list := s.data[key]
-	// Prepend values in reverse order so the last arg ends up at head
 	for i := len(values) - 1; i >= 0; i-- {
 		list = append([]string{values[i]}, list...)
 	}
@@ -98,7 +98,6 @@ func (s *ListStore) LRange(key string, start, stop int) []string {
 	}
 	length := len(list)
 
-	// Normalize negative indices
 	if start < 0 {
 		start = length + start
 	}
@@ -106,7 +105,6 @@ func (s *ListStore) LRange(key string, start, stop int) []string {
 		stop = length + stop
 	}
 
-	// Clamp
 	if start < 0 {
 		start = 0
 	}
@@ -117,7 +115,6 @@ func (s *ListStore) LRange(key string, start, stop int) []string {
 		return []string{}
 	}
 
-	// Return a copy
 	result := make([]string, stop-start+1)
 	copy(result, list[start:stop+1])
 	return result
@@ -227,4 +224,133 @@ func (s *ListStore) Flush() {
 	s.mu.Lock()
 	s.data = make(map[string][]string)
 	s.mu.Unlock()
+}
+
+// LRem removes elements equal to value from the list stored at key.
+// If count > 0: removes elements equal to value moving from head to tail.
+// If count < 0: removes elements equal to value moving from tail to head.
+// If count == 0: removes all elements equal to value.
+// Returns the number of removed elements.
+func (s *ListStore) LRem(key string, count int, value string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	list, ok := s.data[key]
+	if !ok || len(list) == 0 {
+		return 0
+	}
+
+	removed := 0
+	var newList []string
+
+	if count == 0 {
+		for _, v := range list {
+			if v == value {
+				removed++
+			} else {
+				newList = append(newList, v)
+			}
+		}
+	} else if count > 0 {
+		for _, v := range list {
+			if v == value && removed < count {
+				removed++
+			} else {
+				newList = append(newList, v)
+			}
+		}
+	} else { // count < 0
+		absLimit := -count
+		for i := len(list) - 1; i >= 0; i-- {
+			v := list[i]
+			if v == value && removed < absLimit {
+				removed++
+			} else {
+				newList = append([]string{v}, newList...)
+			}
+		}
+	}
+
+	if removed > 0 {
+		s.data[key] = newList
+		if len(newList) == 0 {
+			delete(s.data, key)
+		}
+	}
+	return removed
+}
+
+// LTrim trims the list at key to the specified start/stop range (inclusive).
+func (s *ListStore) LTrim(key string, start, stop int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	list, ok := s.data[key]
+	if !ok || len(list) == 0 {
+		return
+	}
+
+	length := len(list)
+	if start < 0 {
+		start = length + start
+	}
+	if stop < 0 {
+		stop = length + stop
+	}
+	if start < 0 {
+		start = 0
+	}
+	if stop >= length {
+		stop = length - 1
+	}
+	if start > stop || start >= length {
+		delete(s.data, key)
+		return
+	}
+
+	s.data[key] = list[start : stop+1]
+}
+
+// LInsert inserts value before or after pivot in the list stored at key.
+// position must be "BEFORE" or "AFTER" (case-insensitive).
+// Returns the new list length, or -1 if the pivot was not found.
+func (s *ListStore) LInsert(key string, position string, pivot string, value string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	list, ok := s.data[key]
+	if !ok || len(list) == 0 {
+		return 0, nil
+	}
+
+	pos := strings.ToUpper(position)
+	if pos != "BEFORE" && pos != "AFTER" {
+		return 0, errors.New("ERR syntax error")
+	}
+
+	pivotIdx := -1
+	for i, v := range list {
+		if v == pivot {
+			pivotIdx = i
+			break
+		}
+	}
+
+	if pivotIdx == -1 {
+		return -1, nil
+	}
+
+	var newList []string
+	if pos == "BEFORE" {
+		newList = append(newList, list[:pivotIdx]...)
+		newList = append(newList, value)
+		newList = append(newList, list[pivotIdx:]...)
+	} else {
+		newList = append(newList, list[:pivotIdx+1]...)
+		newList = append(newList, value)
+		newList = append(newList, list[pivotIdx+1:]...)
+	}
+
+	s.data[key] = newList
+	return len(newList), nil
 }
