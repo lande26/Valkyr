@@ -13,21 +13,25 @@ import (
 
 // Config holds all Valkyr server configuration options.
 type Config struct {
-	Port      int    // TCP port to listen on (default: 6379)
-	Bind      string // Address to bind to (default: "0.0.0.0")
-	AOFPath   string // Path to the AOF persistence file (default: "valkyr.aof")
-	LogLevel  string // Logging level: debug, info, warn, error (default: "info")
-	NoPersist bool   // If true, disable AOF persistence entirely
+	Port            int    // TCP port to listen on (default: 6379)
+	Bind            string // Address to bind to (default: "0.0.0.0")
+	AOFPath         string // Path to the AOF persistence file (default: "valkyr.aof")
+	LogLevel        string // Logging level: debug, info, warn, error (default: "info")
+	NoPersist       bool   // If true, disable AOF persistence entirely
+	MaxMemory       int64  // Maximum memory limit in bytes (default: 0, unlimited)
+	MaxMemoryPolicy string // Eviction policy when limit is reached (default: "noeviction")
 }
 
 // DefaultConfig returns a Config with sensible default values.
 func DefaultConfig() *Config {
 	return &Config{
-		Port:      6379,
-		Bind:      "0.0.0.0",
-		AOFPath:   "valkyr.aof",
-		LogLevel:  "info",
-		NoPersist: false,
+		Port:            6379,
+		Bind:            "0.0.0.0",
+		AOFPath:         "valkyr.aof",
+		LogLevel:        "info",
+		NoPersist:       false,
+		MaxMemory:       0,
+		MaxMemoryPolicy: "noeviction",
 	}
 }
 
@@ -87,6 +91,12 @@ func (c *Config) loadFromFile(path string) error {
 			c.LogLevel = strings.ToLower(value)
 		case "no-persist":
 			c.NoPersist = strings.ToLower(value) == "yes" || value == "1" || strings.ToLower(value) == "true"
+		case "maxmemory":
+			if m, err := strconv.ParseInt(value, 10, 64); err == nil {
+				c.MaxMemory = m
+			}
+		case "maxmemory-policy":
+			c.MaxMemoryPolicy = strings.ToLower(value)
 		}
 	}
 	return scanner.Err()
@@ -99,6 +109,8 @@ func (c *Config) loadFromFlags() {
 	aofPath := flag.String("aof-path", "", "Path to AOF persistence file")
 	logLevel := flag.String("loglevel", "", "Log level: debug, info, warn, error")
 	noPersist := flag.Bool("no-persist", false, "Disable AOF persistence")
+	maxMemory := flag.Int64("maxmemory", 0, "Max memory limit in bytes")
+	maxMemoryPolicy := flag.String("maxmemory-policy", "", "Eviction policy when maxmemory is reached")
 
 	flag.Parse()
 
@@ -116,6 +128,12 @@ func (c *Config) loadFromFlags() {
 	}
 	if *noPersist {
 		c.NoPersist = true
+	}
+	if *maxMemory != 0 {
+		c.MaxMemory = *maxMemory
+	}
+	if *maxMemoryPolicy != "" {
+		c.MaxMemoryPolicy = strings.ToLower(*maxMemoryPolicy)
 	}
 }
 

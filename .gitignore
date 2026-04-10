@@ -18,3 +18,10 @@ Thumbs.db
 
 # Go
 vendor/
+valkyr-bin
+valkyr-bin.exe
+valkyr.aof.tmp
+test.aof
+test.aof.tmp
+valkyr-test-*
+
