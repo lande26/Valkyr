@@ -18,9 +18,11 @@ import (
 
 // AOF manages the append-only persistence file.
 type AOF struct {
-	mu   sync.Mutex
-	file *os.File
-	buf  *bufio.Writer
+	mu            sync.Mutex
+	file          *os.File
+	buf           *bufio.Writer
+	rewriteActive bool
+	rewriteBuf    [][]resp.Value
 }
 
 // New opens (or creates) the AOF file at the given path in append mode
@@ -50,6 +52,82 @@ func (a *AOF) Log(args []resp.Value) error {
 		s := arg.Str
 		fmt.Fprintf(a.buf, "$%d\r\n%s\r\n", len(s), s)
 	}
+
+	if a.rewriteActive {
+		a.rewriteBuf = append(a.rewriteBuf, args)
+	}
+
+	return nil
+}
+
+// StartRewrite signals that AOF rewrite has started. Subsequent Logs will be buffered.
+func (a *AOF) StartRewrite() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.rewriteActive = true
+	a.rewriteBuf = nil
+}
+
+// FinalizeRewrite writes the buffered commands to the temp AOF, replaces the main file with the temp file,
+// and resets the state.
+func (a *AOF) FinalizeRewrite(tempPath string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Open temp file for appending the buffered commands
+	tmpFile, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("aof finalize: failed to open temp file: %w", err)
+	}
+	tmpBuf := bufio.NewWriter(tmpFile)
+
+	// Write buffered commands to temp file
+	for _, args := range a.rewriteBuf {
+		fmt.Fprintf(tmpBuf, "*%d\r\n", len(args))
+		for _, arg := range args {
+			s := arg.Str
+			fmt.Fprintf(tmpBuf, "$%d\r\n%s\r\n", len(s), s)
+		}
+	}
+
+	if err := tmpBuf.Flush(); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("aof finalize: temp flush failed: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("aof finalize: temp fsync failed: %w", err)
+	}
+	tmpFile.Close()
+
+	// Close old main file
+	mainPath := a.file.Name()
+	if err := a.buf.Flush(); err != nil {
+		slog.Warn("AOF main flush before replacement failed", "err", err)
+	}
+	_ = a.file.Close()
+
+	// Atomic replacement (on Unix/macOS rename is atomic)
+	if err := os.Rename(tempPath, mainPath); err != nil {
+		// Try to reopen old file
+		f, reopenErr := os.OpenFile(mainPath, os.O_RDWR|os.O_APPEND, 0644)
+		if reopenErr == nil {
+			a.file = f
+			a.buf = bufio.NewWriter(f)
+		}
+		return fmt.Errorf("aof finalize: rename failed: %w", err)
+	}
+
+	// Reopen the new main file
+	f, err := os.OpenFile(mainPath, os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("aof finalize: failed to reopen new main file: %w", err)
+	}
+	a.file = f
+	a.buf = bufio.NewWriter(f)
+
+	a.rewriteActive = false
+	a.rewriteBuf = nil
 
 	return nil
 }
