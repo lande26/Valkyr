@@ -3,6 +3,7 @@
 package server
 
 import (
+	"bufio"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,24 +33,33 @@ type Server struct {
 	peersMu    sync.Mutex
 	startTime  time.Time
 	cmdCount   int64
-	shutdownCh chan struct{}
-	aofWriter  AOFWriter // optional, set after construction
+	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
+	aofWriter    AOFWriter // optional, set after construction
+
+	// Pub/Sub fields
+	pubsubMu       sync.RWMutex
+	pubsubChannels map[string]map[*Peer]bool
+	pubsubPatterns map[string]map[*Peer]bool
 }
 
 // AOFWriter is the interface that the AOF persistence layer must satisfy.
-// This allows the server to log write commands without importing the aof package.
 type AOFWriter interface {
 	Log(args []resp.Value) error
+	StartRewrite()
+	FinalizeRewrite(tempPath string) error
 }
 
 // NewServer creates a new Server with the given configuration.
 func NewServer(cfg *config.Config) *Server {
 	s := &Server{
-		cfg:        cfg,
-		store:      store.NewStore(),
-		peers:      make(map[*Peer]bool),
-		startTime:  time.Now(),
-		shutdownCh: make(chan struct{}),
+		cfg:            cfg,
+		store:          store.NewStore(),
+		peers:          make(map[*Peer]bool),
+		startTime:      time.Now(),
+		shutdownCh:     make(chan struct{}),
+		pubsubChannels: make(map[string]map[*Peer]bool),
+		pubsubPatterns: make(map[string]map[*Peer]bool),
 	}
 	s.router = NewRouter(s)
 	return s
@@ -62,7 +73,7 @@ func (s *Server) Store() *store.Store {
 // DispatchCommand dispatches a command through the router.
 // Used by AOF replay to re-execute persisted commands on startup.
 func (s *Server) DispatchCommand(args []resp.Value) resp.Value {
-	return s.router.Dispatch(args)
+	return s.router.Dispatch(nil, args)
 }
 
 // SetAOFWriter sets the AOF persistence writer. Must be called before Start.
@@ -176,20 +187,189 @@ func (s *Server) ConnectedClients() int {
 // Shutdown gracefully shuts down the server: closes the listener,
 // disconnects all clients, stops the TTL sweeper.
 func (s *Server) Shutdown() {
-	close(s.shutdownCh)
-	if s.ln != nil {
-		s.ln.Close()
-	}
-	s.store.TTL.StopSweeper()
+	s.shutdownOnce.Do(func() {
+		close(s.shutdownCh)
+		if s.ln != nil {
+			s.ln.Close()
+		}
+		s.store.TTL.StopSweeper()
 
-	// Close all peer connections
-	s.peersMu.Lock()
-	for peer := range s.peers {
-		peer.Close()
-	}
-	s.peersMu.Unlock()
+		// Close all peer connections
+		s.peersMu.Lock()
+		for peer := range s.peers {
+			peer.Close()
+		}
+		s.peersMu.Unlock()
 
-	slog.Info("Valkyr server shut down")
+		slog.Info("Valkyr server shut down")
+	})
+}
+
+// CheckAndEvictMemory inspects memory limits and performs eviction if necessary.
+func (s *Server) CheckAndEvictMemory() resp.Value {
+	if s.cfg.MaxMemory <= 0 {
+		return resp.Value{}
+	}
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	used := int64(m.Alloc)
+
+	if used < s.cfg.MaxMemory {
+		return resp.Value{}
+	}
+
+	if s.cfg.MaxMemoryPolicy == "noeviction" {
+		return resp.ErrorValue("OOM command not allowed when used memory > 'maxmemory'")
+	}
+
+	// Try to evict keys
+	for i := 0; i < 50; i++ {
+		evicted := s.store.Evict(s.cfg.MaxMemoryPolicy, 1)
+		if evicted == 0 {
+			break // Nothing left to evict
+		}
+		runtime.ReadMemStats(&m)
+		if int64(m.Alloc) < s.cfg.MaxMemory {
+			return resp.Value{} // Successfully cleared enough memory!
+		}
+	}
+
+	// Double check memory
+	runtime.ReadMemStats(&m)
+	if int64(m.Alloc) >= s.cfg.MaxMemory {
+		return resp.ErrorValue("OOM command not allowed when used memory > 'maxmemory'")
+	}
+
+	return resp.Value{}
+}
+
+// GenerateSnapshotCommands returns a point-in-time list of commands representing the full database state.
+func (s *Server) GenerateSnapshotCommands() [][]resp.Value {
+	keys := s.store.AllKeys()
+	var cmds [][]resp.Value
+
+	for _, key := range keys {
+		t := s.store.KeyType(key)
+		switch t {
+		case "string":
+			val, ok := s.store.Strings.Get(key)
+			if ok {
+				cmds = append(cmds, []resp.Value{
+					resp.BulkStringValue("SET"),
+					resp.BulkStringValue(key),
+					resp.BulkStringValue(val),
+				})
+			}
+		case "hash":
+			h := s.store.Hashes.HGetAll(key)
+			if len(h) > 0 {
+				args := []resp.Value{
+					resp.BulkStringValue("HSET"),
+					resp.BulkStringValue(key),
+				}
+				for f, v := range h {
+					args = append(args, resp.BulkStringValue(f), resp.BulkStringValue(v))
+				}
+				cmds = append(cmds, args)
+			}
+		case "list":
+			elems := s.store.Lists.LRange(key, 0, -1)
+			if len(elems) > 0 {
+				args := []resp.Value{
+					resp.BulkStringValue("RPUSH"),
+					resp.BulkStringValue(key),
+				}
+				for _, e := range elems {
+					args = append(args, resp.BulkStringValue(e))
+				}
+				cmds = append(cmds, args)
+			}
+		case "set":
+			mems := s.store.Sets.SMembers(key)
+			if len(mems) > 0 {
+				args := []resp.Value{
+					resp.BulkStringValue("SADD"),
+					resp.BulkStringValue(key),
+				}
+				for _, m := range mems {
+					args = append(args, resp.BulkStringValue(m))
+				}
+				cmds = append(cmds, args)
+			}
+		case "zset":
+			mems := s.store.ZSets.ZRange(key, 0, -1)
+			if len(mems) > 0 {
+				args := []resp.Value{
+					resp.BulkStringValue("ZADD"),
+					resp.BulkStringValue(key),
+				}
+				for _, m := range mems {
+					scoreStr := fmt.Sprintf("%g", m.Score)
+					args = append(args, resp.BulkStringValue(scoreStr), resp.BulkStringValue(m.Member))
+				}
+				cmds = append(cmds, args)
+			}
+		}
+
+		// TTL check
+		if deadline, ok := s.store.TTL.GetDeadline(key); ok {
+			cmds = append(cmds, []resp.Value{
+				resp.BulkStringValue("PEXPIREAT"),
+				resp.BulkStringValue(key),
+				resp.BulkStringValue(strconv.FormatInt(deadline, 10)),
+			})
+		}
+	}
+	return cmds
+}
+
+// BGRewriteAOF starts a background AOF rewrite/compaction.
+func (s *Server) BGRewriteAOF() error {
+	if s.aofWriter == nil {
+		return fmt.Errorf("persistence is disabled")
+	}
+
+	s.aofWriter.StartRewrite()
+
+	// Generate snapshot
+	cmds := s.GenerateSnapshotCommands()
+
+	// Spawn background goroutine to write snapshot to temp file
+	go func() {
+		tempPath := s.cfg.AOFPath + ".tmp"
+		f, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			slog.Error("BGRewriteAOF: failed to create temp file", "err", err)
+			return
+		}
+		buf := bufio.NewWriter(f)
+
+		for _, args := range cmds {
+			fmt.Fprintf(buf, "*%d\r\n", len(args))
+			for _, arg := range args {
+				s := arg.Str
+				fmt.Fprintf(buf, "$%d\r\n%s\r\n", len(s), s)
+			}
+		}
+
+		if err := buf.Flush(); err != nil {
+			f.Close()
+			slog.Error("BGRewriteAOF: failed to flush temp file", "err", err)
+			return
+		}
+		f.Close()
+
+		// Finalize
+		if err := s.aofWriter.FinalizeRewrite(tempPath); err != nil {
+			slog.Error("BGRewriteAOF: failed to finalize rewrite", "err", err)
+			return
+		}
+
+		slog.Info("AOF rewrite/compaction complete", "path", s.cfg.AOFPath)
+	}()
+
+	return nil
 }
 
 // Info returns the formatted INFO string for the INFO command.
@@ -237,4 +417,220 @@ func (s *Server) RandomKey() string {
 		return ""
 	}
 	return keys[rand.Intn(len(keys))]
+}
+
+// Subscribe subscribes the peer to the specified channels.
+func (s *Server) Subscribe(p *Peer, channels []string) {
+	s.pubsubMu.Lock()
+	defer s.pubsubMu.Unlock()
+
+	p.subMu.Lock()
+	defer p.subMu.Unlock()
+
+	for _, ch := range channels {
+		chLower := strings.ToLower(ch)
+		peers, ok := s.pubsubChannels[chLower]
+		if !ok {
+			peers = make(map[*Peer]bool)
+			s.pubsubChannels[chLower] = peers
+		}
+		peers[p] = true
+
+		p.subscribedChannels[chLower] = true
+
+		subCount := len(p.subscribedChannels) + len(p.subscribedPatterns)
+		p.WriteAndFlush(resp.ArrayValue([]resp.Value{
+			resp.BulkStringValue("subscribe"),
+			resp.BulkStringValue(ch),
+			resp.IntegerValue(int64(subCount)),
+		}))
+	}
+}
+
+// Unsubscribe unsubscribes the peer from specified channels.
+// If channels list is empty, unsubscribes from all channels.
+func (s *Server) Unsubscribe(p *Peer, channels []string) {
+	s.pubsubMu.Lock()
+	defer s.pubsubMu.Unlock()
+
+	p.subMu.Lock()
+	defer p.subMu.Unlock()
+
+	if len(channels) == 0 {
+		for ch := range p.subscribedChannels {
+			s.unsubscribePeerFromChannel(p, ch)
+		}
+		if len(p.subscribedChannels) == 0 && len(p.subscribedPatterns) == 0 {
+			p.WriteAndFlush(resp.ArrayValue([]resp.Value{
+				resp.BulkStringValue("unsubscribe"),
+				resp.NullValue(),
+				resp.IntegerValue(0),
+			}))
+		}
+		return
+	}
+
+	for _, ch := range channels {
+		chLower := strings.ToLower(ch)
+		s.unsubscribePeerFromChannel(p, chLower)
+	}
+}
+
+func (s *Server) unsubscribePeerFromChannel(p *Peer, ch string) {
+	if _, exists := p.subscribedChannels[ch]; exists {
+		delete(p.subscribedChannels, ch)
+		if peers, ok := s.pubsubChannels[ch]; ok {
+			delete(peers, p)
+			if len(peers) == 0 {
+				delete(s.pubsubChannels, ch)
+			}
+		}
+	}
+	subCount := len(p.subscribedChannels) + len(p.subscribedPatterns)
+	p.WriteAndFlush(resp.ArrayValue([]resp.Value{
+		resp.BulkStringValue("unsubscribe"),
+		resp.BulkStringValue(ch),
+		resp.IntegerValue(int64(subCount)),
+	}))
+}
+
+// PSubscribe subscribes the peer to specified glob patterns.
+func (s *Server) PSubscribe(p *Peer, patterns []string) {
+	s.pubsubMu.Lock()
+	defer s.pubsubMu.Unlock()
+
+	p.subMu.Lock()
+	defer p.subMu.Unlock()
+
+	for _, pattern := range patterns {
+		patLower := strings.ToLower(pattern)
+		peers, ok := s.pubsubPatterns[patLower]
+		if !ok {
+			peers = make(map[*Peer]bool)
+			s.pubsubPatterns[patLower] = peers
+		}
+		peers[p] = true
+
+		p.subscribedPatterns[patLower] = true
+
+		subCount := len(p.subscribedChannels) + len(p.subscribedPatterns)
+		p.WriteAndFlush(resp.ArrayValue([]resp.Value{
+			resp.BulkStringValue("psubscribe"),
+			resp.BulkStringValue(pattern),
+			resp.IntegerValue(int64(subCount)),
+		}))
+	}
+}
+
+// PUnsubscribe unsubscribes the peer from specified patterns.
+// If patterns is empty, unsubscribes from all patterns.
+func (s *Server) PUnsubscribe(p *Peer, patterns []string) {
+	s.pubsubMu.Lock()
+	defer s.pubsubMu.Unlock()
+
+	p.subMu.Lock()
+	defer p.subMu.Unlock()
+
+	if len(patterns) == 0 {
+		for pat := range p.subscribedPatterns {
+			s.punsubscribePeerFromPattern(p, pat)
+		}
+		if len(p.subscribedChannels) == 0 && len(p.subscribedPatterns) == 0 {
+			p.WriteAndFlush(resp.ArrayValue([]resp.Value{
+				resp.BulkStringValue("punsubscribe"),
+				resp.NullValue(),
+				resp.IntegerValue(0),
+			}))
+		}
+		return
+	}
+
+	for _, pat := range patterns {
+		patLower := strings.ToLower(pat)
+		s.punsubscribePeerFromPattern(p, patLower)
+	}
+}
+
+func (s *Server) punsubscribePeerFromPattern(p *Peer, pat string) {
+	if _, exists := p.subscribedPatterns[pat]; exists {
+		delete(p.subscribedPatterns, pat)
+		if peers, ok := s.pubsubPatterns[pat]; ok {
+			delete(peers, p)
+			if len(peers) == 0 {
+				delete(s.pubsubPatterns, pat)
+			}
+		}
+	}
+	subCount := len(p.subscribedChannels) + len(p.subscribedPatterns)
+	p.WriteAndFlush(resp.ArrayValue([]resp.Value{
+		resp.BulkStringValue("punsubscribe"),
+		resp.BulkStringValue(pat),
+		resp.IntegerValue(int64(subCount)),
+	}))
+}
+
+// UnsubscribeAll is called on client disconnect to clean up all registrations.
+func (s *Server) UnsubscribeAll(p *Peer) {
+	s.pubsubMu.Lock()
+	defer s.pubsubMu.Unlock()
+
+	p.subMu.Lock()
+	defer p.subMu.Unlock()
+
+	for ch := range p.subscribedChannels {
+		if peers, ok := s.pubsubChannels[ch]; ok {
+			delete(peers, p)
+			if len(peers) == 0 {
+				delete(s.pubsubChannels, ch)
+			}
+		}
+	}
+	for pat := range p.subscribedPatterns {
+		if peers, ok := s.pubsubPatterns[pat]; ok {
+			delete(peers, p)
+			if len(peers) == 0 {
+				delete(s.pubsubPatterns, pat)
+			}
+		}
+	}
+}
+
+// Publish sends message to all subscribers of a channel and matching patterns.
+func (s *Server) Publish(channel string, message string) int {
+	s.pubsubMu.RLock()
+	defer s.pubsubMu.RUnlock()
+
+	chLower := strings.ToLower(channel)
+	receivers := make(map[*Peer]bool)
+
+	// Direct subscribers
+	if peers, ok := s.pubsubChannels[chLower]; ok {
+		for p := range peers {
+			receivers[p] = true
+			p.WriteAndFlush(resp.ArrayValue([]resp.Value{
+				resp.BulkStringValue("message"),
+				resp.BulkStringValue(channel),
+				resp.BulkStringValue(message),
+			}))
+		}
+	}
+
+	// Pattern subscribers
+	for pattern, peers := range s.pubsubPatterns {
+		if matchGlob(pattern, chLower) {
+			for p := range peers {
+				if !receivers[p] {
+					receivers[p] = true
+					p.WriteAndFlush(resp.ArrayValue([]resp.Value{
+						resp.BulkStringValue("pmessage"),
+						resp.BulkStringValue(pattern),
+						resp.BulkStringValue(channel),
+						resp.BulkStringValue(message),
+					}))
+				}
+			}
+		}
+	}
+
+	return len(receivers)
 }
