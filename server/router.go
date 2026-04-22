@@ -2,17 +2,16 @@ package server
 
 import (
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kartik/valkyr/resp"
 	"github.com/kartik/valkyr/store"
 )
 
 // HandlerFunc is the signature for command handler functions.
-// It receives the command arguments (excluding the command name) and returns a RESP Value.
-type HandlerFunc func(args []resp.Value) resp.Value
+type HandlerFunc func(p *Peer, args []resp.Value) resp.Value
 
 // Router maps command names to their handler functions and dispatches incoming commands.
 type Router struct {
@@ -29,6 +28,14 @@ var writeCommands = map[string]bool{
 	"SADD": true, "SREM": true,
 	"EXPIRE": true, "EXPIREAT": true, "PERSIST": true,
 	"FLUSHDB": true, "RENAME": true,
+
+	// New write commands
+	"GETSET": true, "SETEX": true, "PSETEX": true, "SETRANGE": true, "DECRBY": true, "MSETNX": true,
+	"HINCRBY": true, "HINCRBYFLOAT": true,
+	"LREM": true, "LTRIM": true, "LINSERT": true, "RPOPLPUSH": true,
+	"SPOP": true, "SMOVE": true,
+	"ZADD": true, "ZREM": true,
+	"PEXPIRE": true, "PEXPIREAT": true, "UNLINK": true, "TOUCH": true,
 }
 
 // NewRouter creates a new Router and registers all command handlers.
@@ -41,9 +48,15 @@ func NewRouter(s *Server) *Router {
 	return r
 }
 
+// HasHandler returns true if a command has a registered handler.
+func (r *Router) HasHandler(cmd string) bool {
+	_, ok := r.handlers[strings.ToUpper(cmd)]
+	return ok
+}
+
 // Dispatch looks up and executes the handler for the given command.
 // Returns a RESP error if the command is unknown.
-func (r *Router) Dispatch(args []resp.Value) resp.Value {
+func (r *Router) Dispatch(p *Peer, args []resp.Value) resp.Value {
 	if len(args) == 0 {
 		return resp.ErrorValue("ERR empty command")
 	}
@@ -54,7 +67,14 @@ func (r *Router) Dispatch(args []resp.Value) resp.Value {
 		return resp.ErrorValue(fmt.Sprintf("ERR unknown command '%s'", cmd))
 	}
 
-	result := handler(args[1:])
+	// Memory eviction check before running write commands
+	if writeCommands[cmd] {
+		if errVal := r.server.CheckAndEvictMemory(); errVal.Typ == resp.Error {
+			return errVal
+		}
+	}
+
+	result := handler(p, args[1:])
 
 	// Log write commands to AOF
 	if writeCommands[cmd] && result.Typ != resp.Error {
@@ -83,6 +103,14 @@ func (r *Router) registerAll() {
 	r.handlers["INCRBY"] = r.makeStringCmd(st, cmdINCRBY)
 	r.handlers["APPEND"] = r.makeStringCmd(st, cmdAPPEND)
 	r.handlers["STRLEN"] = r.makeStringCmd(st, cmdSTRLEN)
+	// New String
+	r.handlers["GETSET"] = r.makeStringCmd(st, cmdGETSET)
+	r.handlers["SETEX"] = r.makeStringCmd(st, cmdSETEX)
+	r.handlers["PSETEX"] = r.makeStringCmd(st, cmdPSETEX)
+	r.handlers["SETRANGE"] = r.makeStringCmd(st, cmdSETRANGE)
+	r.handlers["GETRANGE"] = r.makeStringCmd(st, cmdGETRANGE)
+	r.handlers["DECRBY"] = r.makeStringCmd(st, cmdDECRBY)
+	r.handlers["MSETNX"] = r.makeStringCmd(st, cmdMSETNX)
 
 	// --- Hash ---
 	r.handlers["HSET"] = r.makeHashCmd(st, cmdHSET)
@@ -94,6 +122,12 @@ func (r *Router) registerAll() {
 	r.handlers["HEXISTS"] = r.makeHashCmd(st, cmdHEXISTS)
 	r.handlers["HMSET"] = r.makeHashCmd(st, cmdHMSET)
 	r.handlers["HMGET"] = r.makeHashCmd(st, cmdHMGET)
+	// New Hash
+	r.handlers["HINCRBY"] = r.makeHashCmd(st, cmdHINCRBY)
+	r.handlers["HINCRBYFLOAT"] = r.makeHashCmd(st, cmdHINCRBYFLOAT)
+	r.handlers["HVALS"] = r.makeHashCmd(st, cmdHVALS)
+	r.handlers["HSCAN"] = r.makeHashCmd(st, cmdHSCAN)
+	r.handlers["HSTRLEN"] = r.makeHashCmd(st, cmdHSTRLEN)
 
 	// --- List ---
 	r.handlers["LPUSH"] = r.makeListCmd(st, cmdLPUSH)
@@ -104,6 +138,11 @@ func (r *Router) registerAll() {
 	r.handlers["LRANGE"] = r.makeListCmd(st, cmdLRANGE)
 	r.handlers["LINDEX"] = r.makeListCmd(st, cmdLINDEX)
 	r.handlers["LSET"] = r.makeListCmd(st, cmdLSET)
+	// New List
+	r.handlers["LREM"] = r.makeListCmd(st, cmdLREM)
+	r.handlers["LTRIM"] = r.makeListCmd(st, cmdLTRIM)
+	r.handlers["LINSERT"] = r.makeListCmd(st, cmdLINSERT)
+	r.handlers["RPOPLPUSH"] = r.makeListCmd(st, cmdRPOPLPUSH)
 
 	// --- Set ---
 	r.handlers["SADD"] = r.makeSetCmd(st, cmdSADD)
@@ -114,6 +153,34 @@ func (r *Router) registerAll() {
 	r.handlers["SINTER"] = r.makeSetCmd(st, cmdSINTER)
 	r.handlers["SUNION"] = r.makeSetCmd(st, cmdSUNION)
 	r.handlers["SDIFF"] = r.makeSetCmd(st, cmdSDIFF)
+	// New Set
+	r.handlers["SPOP"] = r.makeSetCmd(st, cmdSPOP)
+	r.handlers["SRANDMEMBER"] = r.makeSetCmd(st, cmdSRANDMEMBER)
+	r.handlers["SMOVE"] = r.makeSetCmd(st, cmdSMOVE)
+	r.handlers["SSCAN"] = r.makeSetCmd(st, cmdSSCAN)
+
+	// --- ZSet (New) ---
+	r.handlers["ZADD"] = r.makeZSetCmd(st, cmdZADD)
+	r.handlers["ZRANGE"] = r.makeZSetCmd(st, cmdZRANGE)
+	r.handlers["ZREM"] = r.makeZSetCmd(st, cmdZREM)
+	r.handlers["ZCARD"] = r.makeZSetCmd(st, cmdZCARD)
+	r.handlers["ZSCORE"] = r.makeZSetCmd(st, cmdZSCORE)
+	r.handlers["ZRANK"] = r.makeZSetCmd(st, cmdZRANK)
+	r.handlers["ZREVRANGE"] = r.makeZSetCmd(st, cmdZREVRANGE)
+	r.handlers["ZREVRANK"] = r.makeZSetCmd(st, cmdZREVRANK)
+	r.handlers["ZCOUNT"] = r.makeZSetCmd(st, cmdZCOUNT)
+
+	// --- Pub/Sub (New) ---
+	r.handlers["SUBSCRIBE"] = r.cmdSubscribe
+	r.handlers["UNSUBSCRIBE"] = r.cmdUnsubscribe
+	r.handlers["PSUBSCRIBE"] = r.cmdPSubscribe
+	r.handlers["PUNSUBSCRIBE"] = r.cmdPUnsubscribe
+	r.handlers["PUBLISH"] = r.cmdPublish
+
+	// --- Transactions (New) ---
+	r.handlers["MULTI"] = r.cmdMulti
+	r.handlers["EXEC"] = r.cmdExec
+	r.handlers["DISCARD"] = r.cmdDiscard
 
 	// --- Key/TTL ---
 	r.handlers["DEL"] = r.cmdDel
@@ -130,28 +197,34 @@ func (r *Router) registerAll() {
 	r.handlers["FLUSHDB"] = r.cmdFlushDB
 	r.handlers["INFO"] = r.cmdInfo
 	r.handlers["BGSAVE"] = r.cmdBGSave
+	r.handlers["BGREWRITEAOF"] = r.cmdBGRewriteAOF
+
+	// New Key/TTL
+	r.handlers["SCAN"] = r.cmdScan
+	r.handlers["PTTL"] = r.cmdPTTL
+	r.handlers["PEXPIRE"] = r.cmdPExpire
+	r.handlers["PEXPIREAT"] = r.cmdPExpireAt
+	r.handlers["UNLINK"] = r.cmdUnlink
+	r.handlers["TOUCH"] = r.cmdTouch
 }
 
 // ───────────────────────── Connection Commands ─────────────────────────
 
-// cmdPing handles the PING command.
-func (r *Router) cmdPing(args []resp.Value) resp.Value {
+func (r *Router) cmdPing(p *Peer, args []resp.Value) resp.Value {
 	if len(args) == 0 {
 		return resp.SimpleStringValue("PONG")
 	}
 	return resp.BulkStringValue(args[0].Str)
 }
 
-// cmdEcho handles the ECHO command.
-func (r *Router) cmdEcho(args []resp.Value) resp.Value {
+func (r *Router) cmdEcho(p *Peer, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'echo' command")
 	}
 	return resp.BulkStringValue(args[0].Str)
 }
 
-// cmdCommand handles the COMMAND command (stub that returns OK for redis-cli compatibility).
-func (r *Router) cmdCommand(args []resp.Value) resp.Value {
+func (r *Router) cmdCommand(p *Peer, args []resp.Value) resp.Value {
 	return resp.SimpleStringValue("OK")
 }
 
@@ -161,38 +234,40 @@ type stringCmdFunc func(st *store.Store, args []resp.Value) resp.Value
 type hashCmdFunc func(st *store.Store, args []resp.Value) resp.Value
 type listCmdFunc func(st *store.Store, args []resp.Value) resp.Value
 type setCmdFunc func(st *store.Store, args []resp.Value) resp.Value
+type zsetCmdFunc func(st *store.Store, args []resp.Value) resp.Value
 
-// makeStringCmd wraps a string command with type checking.
 func (r *Router) makeStringCmd(st *store.Store, fn stringCmdFunc) HandlerFunc {
-	return func(args []resp.Value) resp.Value {
+	return func(p *Peer, args []resp.Value) resp.Value {
 		return fn(st, args)
 	}
 }
 
-// makeHashCmd wraps a hash command.
 func (r *Router) makeHashCmd(st *store.Store, fn hashCmdFunc) HandlerFunc {
-	return func(args []resp.Value) resp.Value {
+	return func(p *Peer, args []resp.Value) resp.Value {
 		return fn(st, args)
 	}
 }
 
-// makeListCmd wraps a list command.
 func (r *Router) makeListCmd(st *store.Store, fn listCmdFunc) HandlerFunc {
-	return func(args []resp.Value) resp.Value {
+	return func(p *Peer, args []resp.Value) resp.Value {
 		return fn(st, args)
 	}
 }
 
-// makeSetCmd wraps a set command.
 func (r *Router) makeSetCmd(st *store.Store, fn setCmdFunc) HandlerFunc {
-	return func(args []resp.Value) resp.Value {
+	return func(p *Peer, args []resp.Value) resp.Value {
+		return fn(st, args)
+	}
+}
+
+func (r *Router) makeZSetCmd(st *store.Store, fn zsetCmdFunc) HandlerFunc {
+	return func(p *Peer, args []resp.Value) resp.Value {
 		return fn(st, args)
 	}
 }
 
 // ───────────────────────── String Commands ─────────────────────────
 
-// cmdSET handles SET key value [EX seconds] [NX|XX]
 func cmdSET(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'set' command")
@@ -200,7 +275,6 @@ func cmdSET(st *store.Store, args []resp.Value) resp.Value {
 	key := args[0].Str
 	value := args[1].Str
 
-	// Check WRONGTYPE
 	if t := st.KeyType(key); t != "none" && t != "string" {
 		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
@@ -209,7 +283,6 @@ func cmdSET(st *store.Store, args []resp.Value) resp.Value {
 	nx := false
 	xx := false
 
-	// Parse optional flags
 	for i := 2; i < len(args); i++ {
 		flag := strings.ToUpper(args[i].Str)
 		switch flag {
@@ -264,14 +337,12 @@ func cmdSET(st *store.Store, args []resp.Value) resp.Value {
 	return resp.SimpleStringValue("OK")
 }
 
-// cmdGET handles GET key
 func cmdGET(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'get' command")
 	}
 	key := args[0].Str
 
-	// Check WRONGTYPE
 	if t := st.KeyType(key); t != "none" && t != "string" {
 		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
@@ -283,7 +354,6 @@ func cmdGET(st *store.Store, args []resp.Value) resp.Value {
 	return resp.BulkStringValue(val)
 }
 
-// cmdMSET handles MSET key value [key value ...]
 func cmdMSET(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 || len(args)%2 != 0 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'mset' command")
@@ -296,7 +366,6 @@ func cmdMSET(st *store.Store, args []resp.Value) resp.Value {
 	return resp.SimpleStringValue("OK")
 }
 
-// cmdMGET handles MGET key [key ...]
 func cmdMGET(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'mget' command")
@@ -317,7 +386,6 @@ func cmdMGET(st *store.Store, args []resp.Value) resp.Value {
 	return resp.ArrayValue(result)
 }
 
-// cmdINCR handles INCR key
 func cmdINCR(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'incr' command")
@@ -332,7 +400,6 @@ func cmdINCR(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(n)
 }
 
-// cmdDECR handles DECR key
 func cmdDECR(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'decr' command")
@@ -347,7 +414,6 @@ func cmdDECR(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(n)
 }
 
-// cmdINCRBY handles INCRBY key increment
 func cmdINCRBY(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'incrby' command")
@@ -366,7 +432,6 @@ func cmdINCRBY(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(n)
 }
 
-// cmdAPPEND handles APPEND key value
 func cmdAPPEND(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'append' command")
@@ -378,7 +443,6 @@ func cmdAPPEND(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(l))
 }
 
-// cmdSTRLEN handles STRLEN key
 func cmdSTRLEN(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'strlen' command")
@@ -389,9 +453,172 @@ func cmdSTRLEN(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(st.Strings.StrLen(args[0].Str)))
 }
 
+func cmdGETSET(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'getset' command")
+	}
+	key := args[0].Str
+	value := args[1].Str
+	if t := st.KeyType(key); t != "none" && t != "string" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	old, ok := st.Strings.Get(key)
+	st.Strings.Set(key, value)
+	if !ok {
+		return resp.NullValue()
+	}
+	return resp.BulkStringValue(old)
+}
+
+func cmdSETEX(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'setex' command")
+	}
+	key := args[0].Str
+	seconds, err := strconv.ParseInt(args[1].Str, 10, 64)
+	if err != nil || seconds <= 0 {
+		return resp.ErrorValue("ERR invalid expire time in 'setex' command")
+	}
+	value := args[2].Str
+	if t := st.KeyType(key); t != "none" && t != "string" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	st.Strings.Set(key, value)
+	st.TTL.SetExpire(key, seconds)
+	return resp.SimpleStringValue("OK")
+}
+
+func cmdPSETEX(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'psetex' command")
+	}
+	key := args[0].Str
+	ms, err := strconv.ParseInt(args[1].Str, 10, 64)
+	if err != nil || ms <= 0 {
+		return resp.ErrorValue("ERR invalid expire time in 'psetex' command")
+	}
+	value := args[2].Str
+	if t := st.KeyType(key); t != "none" && t != "string" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	st.Strings.Set(key, value)
+	st.TTL.SetDeadline(key, time.Now().UnixMilli()+ms)
+	return resp.SimpleStringValue("OK")
+}
+
+func cmdSETRANGE(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'setrange' command")
+	}
+	key := args[0].Str
+	offset, err := strconv.Atoi(args[1].Str)
+	if err != nil || offset < 0 {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	value := args[2].Str
+	if t := st.KeyType(key); t != "none" && t != "string" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	old, ok := st.Strings.Get(key)
+	if !ok {
+		old = ""
+	}
+	var newStr string
+	if offset > len(old) {
+		newStr = old + strings.Repeat("\x00", offset-len(old)) + value
+	} else {
+		newStr = old[:offset] + value
+		if offset+len(value) < len(old) {
+			newStr += old[offset+len(value):]
+		}
+	}
+	st.Strings.Set(key, newStr)
+	return resp.IntegerValue(int64(len(newStr)))
+}
+
+func cmdGETRANGE(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'getrange' command")
+	}
+	key := args[0].Str
+	start, err := strconv.Atoi(args[1].Str)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	end, err := strconv.Atoi(args[2].Str)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	if t := st.KeyType(key); t != "none" && t != "string" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	val, ok := st.Strings.Get(key)
+	if !ok {
+		return resp.BulkStringValue("")
+	}
+	length := len(val)
+	if start < 0 {
+		start = length + start
+	}
+	if end < 0 {
+		end = length + end
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end < 0 {
+		end = 0
+	}
+	if start >= length {
+		return resp.BulkStringValue("")
+	}
+	if end >= length {
+		end = length - 1
+	}
+	if start > end {
+		return resp.BulkStringValue("")
+	}
+	return resp.BulkStringValue(val[start : end+1])
+}
+
+func cmdDECRBY(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'decrby' command")
+	}
+	key := args[0].Str
+	delta, err := strconv.ParseInt(args[1].Str, 10, 64)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	if t := st.KeyType(key); t != "none" && t != "string" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	n, err := st.Strings.IncrBy(key, -delta)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(n)
+}
+
+func cmdMSETNX(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) < 2 || len(args)%2 != 0 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'msetnx' command")
+	}
+	for i := 0; i < len(args); i += 2 {
+		if st.KeyExists(args[i].Str) {
+			return resp.IntegerValue(0)
+		}
+	}
+	pairs := make(map[string]string, len(args)/2)
+	for i := 0; i < len(args); i += 2 {
+		pairs[args[i].Str] = args[i+1].Str
+	}
+	st.Strings.MSet(pairs)
+	return resp.IntegerValue(1)
+}
+
 // ───────────────────────── Hash Commands ─────────────────────────
 
-// cmdHSET handles HSET key field value [field value ...]
 func cmdHSET(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 3 || len(args[1:])%2 != 0 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'hset' command")
@@ -408,7 +635,6 @@ func cmdHSET(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(n))
 }
 
-// cmdHGET handles HGET key field
 func cmdHGET(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'hget' command")
@@ -424,7 +650,6 @@ func cmdHGET(st *store.Store, args []resp.Value) resp.Value {
 	return resp.BulkStringValue(val)
 }
 
-// cmdHGETALL handles HGETALL key
 func cmdHGETALL(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'hgetall' command")
@@ -444,7 +669,6 @@ func cmdHGETALL(st *store.Store, args []resp.Value) resp.Value {
 	return resp.ArrayValue(result)
 }
 
-// cmdHDEL handles HDEL key field [field ...]
 func cmdHDEL(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'hdel' command")
@@ -461,7 +685,6 @@ func cmdHDEL(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(n))
 }
 
-// cmdHLEN handles HLEN key
 func cmdHLEN(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'hlen' command")
@@ -473,7 +696,6 @@ func cmdHLEN(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(st.Hashes.HLen(key)))
 }
 
-// cmdHKEYS handles HKEYS key
 func cmdHKEYS(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'hkeys' command")
@@ -490,7 +712,6 @@ func cmdHKEYS(st *store.Store, args []resp.Value) resp.Value {
 	return resp.ArrayValue(result)
 }
 
-// cmdHEXISTS handles HEXISTS key field
 func cmdHEXISTS(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'hexists' command")
@@ -505,24 +726,10 @@ func cmdHEXISTS(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(0)
 }
 
-// cmdHMSET handles HMSET key field value [field value ...] (deprecated alias for HSET)
 func cmdHMSET(st *store.Store, args []resp.Value) resp.Value {
-	if len(args) < 3 || len(args[1:])%2 != 0 {
-		return resp.ErrorValue("ERR wrong number of arguments for 'hmset' command")
-	}
-	key := args[0].Str
-	if t := st.KeyType(key); t != "none" && t != "hash" {
-		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
-	}
-	pairs := make(map[string]string, (len(args)-1)/2)
-	for i := 1; i < len(args); i += 2 {
-		pairs[args[i].Str] = args[i+1].Str
-	}
-	st.Hashes.HSet(key, pairs)
-	return resp.SimpleStringValue("OK")
+	return cmdHSET(st, args)
 }
 
-// cmdHMGET handles HMGET key field [field ...]
 func cmdHMGET(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'hmget' command")
@@ -547,9 +754,107 @@ func cmdHMGET(st *store.Store, args []resp.Value) resp.Value {
 	return resp.ArrayValue(result)
 }
 
+func cmdHINCRBY(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hincrby' command")
+	}
+	key := args[0].Str
+	field := args[1].Str
+	inc, err := strconv.ParseInt(args[2].Str, 10, 64)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	if t := st.KeyType(key); t != "none" && t != "hash" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	n, err := st.Hashes.HIncrBy(key, field, inc)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(n)
+}
+
+func cmdHINCRBYFLOAT(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hincrbyfloat' command")
+	}
+	key := args[0].Str
+	field := args[1].Str
+	inc, err := strconv.ParseFloat(args[2].Str, 64)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not a valid float")
+	}
+	if t := st.KeyType(key); t != "none" && t != "hash" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	n, err := st.Hashes.HIncrByFloat(key, field, inc)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.BulkStringValue(fmt.Sprintf("%g", n))
+}
+
+func cmdHVALS(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hvals' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "hash" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	vals := st.Hashes.HVals(key)
+	result := make([]resp.Value, len(vals))
+	for i, v := range vals {
+		result[i] = resp.BulkStringValue(v)
+	}
+	return resp.ArrayValue(result)
+}
+
+func cmdHSCAN(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) < 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hscan' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "hash" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	h := st.Hashes.HGetAll(key)
+	var matchPattern string
+	for i := 2; i < len(args); i++ {
+		flag := strings.ToUpper(args[i].Str)
+		if flag == "MATCH" && i+1 < len(args) {
+			matchPattern = args[i+1].Str
+			i++
+		} else if flag == "COUNT" && i+1 < len(args) {
+			i++
+		}
+	}
+	var matched []resp.Value
+	for f, v := range h {
+		if matchPattern == "" || matchGlob(matchPattern, f) {
+			matched = append(matched, resp.BulkStringValue(f), resp.BulkStringValue(v))
+		}
+	}
+	return resp.ArrayValue([]resp.Value{
+		resp.BulkStringValue("0"),
+		resp.ArrayValue(matched),
+	})
+}
+
+func cmdHSTRLEN(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hstrlen' command")
+	}
+	key := args[0].Str
+	field := args[1].Str
+	if t := st.KeyType(key); t != "none" && t != "hash" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	return resp.IntegerValue(int64(st.Hashes.HStrLen(key, field)))
+}
+
 // ───────────────────────── List Commands ─────────────────────────
 
-// cmdLPUSH handles LPUSH key element [element ...]
 func cmdLPUSH(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'lpush' command")
@@ -566,7 +871,6 @@ func cmdLPUSH(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(n))
 }
 
-// cmdRPUSH handles RPUSH key element [element ...]
 func cmdRPUSH(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'rpush' command")
@@ -583,7 +887,6 @@ func cmdRPUSH(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(n))
 }
 
-// cmdLPOP handles LPOP key
 func cmdLPOP(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'lpop' command")
@@ -599,7 +902,6 @@ func cmdLPOP(st *store.Store, args []resp.Value) resp.Value {
 	return resp.BulkStringValue(val)
 }
 
-// cmdRPOP handles RPOP key
 func cmdRPOP(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'rpop' command")
@@ -615,7 +917,6 @@ func cmdRPOP(st *store.Store, args []resp.Value) resp.Value {
 	return resp.BulkStringValue(val)
 }
 
-// cmdLLEN handles LLEN key
 func cmdLLEN(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'llen' command")
@@ -627,7 +928,6 @@ func cmdLLEN(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(st.Lists.LLen(key)))
 }
 
-// cmdLRANGE handles LRANGE key start stop
 func cmdLRANGE(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 3 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'lrange' command")
@@ -652,7 +952,6 @@ func cmdLRANGE(st *store.Store, args []resp.Value) resp.Value {
 	return resp.ArrayValue(result)
 }
 
-// cmdLINDEX handles LINDEX key index
 func cmdLINDEX(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'lindex' command")
@@ -672,7 +971,6 @@ func cmdLINDEX(st *store.Store, args []resp.Value) resp.Value {
 	return resp.BulkStringValue(val)
 }
 
-// cmdLSET handles LSET key index element
 func cmdLSET(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 3 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'lset' command")
@@ -691,9 +989,86 @@ func cmdLSET(st *store.Store, args []resp.Value) resp.Value {
 	return resp.SimpleStringValue("OK")
 }
 
+func cmdLREM(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'lrem' command")
+	}
+	key := args[0].Str
+	count, err := strconv.Atoi(args[1].Str)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	value := args[2].Str
+	if t := st.KeyType(key); t != "none" && t != "list" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	n := st.Lists.LRem(key, count, value)
+	return resp.IntegerValue(int64(n))
+}
+
+func cmdLTRIM(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'ltrim' command")
+	}
+	key := args[0].Str
+	start, err := strconv.Atoi(args[1].Str)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	stop, err := strconv.Atoi(args[2].Str)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	if t := st.KeyType(key); t != "none" && t != "list" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	st.Lists.LTrim(key, start, stop)
+	return resp.SimpleStringValue("OK")
+}
+
+func cmdLINSERT(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 4 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'linsert' command")
+	}
+	key := args[0].Str
+	pos := args[1].Str
+	pivot := args[2].Str
+	value := args[3].Str
+	if t := st.KeyType(key); t != "none" && t != "list" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	n, err := st.Lists.LInsert(key, pos, pivot, value)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
+}
+
+func cmdRPOPLPUSH(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'rpoplpush' command")
+	}
+	src := args[0].Str
+	dest := args[1].Str
+
+	if t := st.KeyType(src); t != "none" && t != "list" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	if t := st.KeyType(dest); t != "none" && t != "list" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+
+	val, ok := st.Lists.RPop(src)
+	if !ok {
+		return resp.NullValue()
+	}
+
+	st.Lists.LPush(dest, []string{val})
+	return resp.BulkStringValue(val)
+}
+
 // ───────────────────────── Set Commands ─────────────────────────
 
-// cmdSADD handles SADD key member [member ...]
 func cmdSADD(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'sadd' command")
@@ -710,7 +1085,6 @@ func cmdSADD(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(n))
 }
 
-// cmdSREM handles SREM key member [member ...]
 func cmdSREM(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'srem' command")
@@ -727,7 +1101,6 @@ func cmdSREM(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(n))
 }
 
-// cmdSMEMBERS handles SMEMBERS key
 func cmdSMEMBERS(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'smembers' command")
@@ -744,7 +1117,6 @@ func cmdSMEMBERS(st *store.Store, args []resp.Value) resp.Value {
 	return resp.ArrayValue(result)
 }
 
-// cmdSISMEMBER handles SISMEMBER key member
 func cmdSISMEMBER(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'sismember' command")
@@ -759,7 +1131,6 @@ func cmdSISMEMBER(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(0)
 }
 
-// cmdSCARD handles SCARD key
 func cmdSCARD(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'scard' command")
@@ -771,7 +1142,6 @@ func cmdSCARD(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(st.Sets.SCard(key)))
 }
 
-// cmdSINTER handles SINTER key [key ...]
 func cmdSINTER(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'sinter' command")
@@ -788,7 +1158,6 @@ func cmdSINTER(st *store.Store, args []resp.Value) resp.Value {
 	return resp.ArrayValue(result)
 }
 
-// cmdSUNION handles SUNION key [key ...]
 func cmdSUNION(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'sunion' command")
@@ -805,7 +1174,6 @@ func cmdSUNION(st *store.Store, args []resp.Value) resp.Value {
 	return resp.ArrayValue(result)
 }
 
-// cmdSDIFF handles SDIFF key [key ...]
 func cmdSDIFF(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'sdiff' command")
@@ -822,10 +1190,425 @@ func cmdSDIFF(st *store.Store, args []resp.Value) resp.Value {
 	return resp.ArrayValue(result)
 }
 
+func cmdSPOP(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) < 1 || len(args) > 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'spop' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "set" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	count := 1
+	if len(args) == 2 {
+		var err error
+		count, err = strconv.Atoi(args[1].Str)
+		if err != nil || count <= 0 {
+			return resp.ErrorValue("ERR value is not an integer or out of range")
+		}
+	}
+	popped := st.Sets.SPop(key, count)
+	if popped == nil {
+		if len(args) == 1 {
+			return resp.NullValue()
+		}
+		return resp.ArrayValue([]resp.Value{})
+	}
+	if len(args) == 1 {
+		return resp.BulkStringValue(popped[0])
+	}
+	result := make([]resp.Value, len(popped))
+	for i, m := range popped {
+		result[i] = resp.BulkStringValue(m)
+	}
+	return resp.ArrayValue(result)
+}
+
+func cmdSRANDMEMBER(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) < 1 || len(args) > 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'srandmember' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "set" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	count := 1
+	hasCount := false
+	if len(args) == 2 {
+		hasCount = true
+		var err error
+		count, err = strconv.Atoi(args[1].Str)
+		if err != nil {
+			return resp.ErrorValue("ERR value is not an integer or out of range")
+		}
+	}
+	members := st.Sets.SRandMember(key, count)
+	if members == nil {
+		if hasCount {
+			return resp.ArrayValue([]resp.Value{})
+		}
+		return resp.NullValue()
+	}
+	if !hasCount {
+		return resp.BulkStringValue(members[0])
+	}
+	result := make([]resp.Value, len(members))
+	for i, m := range members {
+		result[i] = resp.BulkStringValue(m)
+	}
+	return resp.ArrayValue(result)
+}
+
+func cmdSMOVE(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'smove' command")
+	}
+	src := args[0].Str
+	dest := args[1].Str
+	member := args[2].Str
+
+	if t := st.KeyType(src); t != "none" && t != "set" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	if t := st.KeyType(dest); t != "none" && t != "set" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+
+	if st.Sets.SMove(src, dest, member) {
+		return resp.IntegerValue(1)
+	}
+	return resp.IntegerValue(0)
+}
+
+func cmdSSCAN(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) < 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'sscan' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "set" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	members := st.Sets.SMembers(key)
+	var matchPattern string
+	for i := 2; i < len(args); i++ {
+		flag := strings.ToUpper(args[i].Str)
+		if flag == "MATCH" && i+1 < len(args) {
+			matchPattern = args[i+1].Str
+			i++
+		} else if flag == "COUNT" && i+1 < len(args) {
+			i++
+		}
+	}
+	var matched []resp.Value
+	for _, m := range members {
+		if matchPattern == "" || matchGlob(matchPattern, m) {
+			matched = append(matched, resp.BulkStringValue(m))
+		}
+	}
+	return resp.ArrayValue([]resp.Value{
+		resp.BulkStringValue("0"),
+		resp.ArrayValue(matched),
+	})
+}
+
+// ───────────────────────── Sorted Set Commands ─────────────────────────
+
+func cmdZADD(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) < 3 || len(args[1:])%2 != 0 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zadd' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "zset" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	added := 0
+	for i := 1; i < len(args); i += 2 {
+		score, err := strconv.ParseFloat(args[i].Str, 64)
+		if err != nil {
+			return resp.ErrorValue("ERR value is not a valid float")
+		}
+		member := args[i+1].Str
+		if st.ZSets.ZAdd(key, score, member) {
+			added++
+		}
+	}
+	return resp.IntegerValue(int64(added))
+}
+
+func cmdZRANGE(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) < 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zrange' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "zset" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	start, err := strconv.Atoi(args[1].Str)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	stop, err := strconv.Atoi(args[2].Str)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	withScores := false
+	if len(args) == 4 && strings.ToUpper(args[3].Str) == "WITHSCORES" {
+		withScores = true
+	}
+	elements := st.ZSets.ZRange(key, start, stop)
+	var res []resp.Value
+	for _, e := range elements {
+		res = append(res, resp.BulkStringValue(e.Member))
+		if withScores {
+			res = append(res, resp.BulkStringValue(fmt.Sprintf("%g", e.Score)))
+		}
+	}
+	return resp.ArrayValue(res)
+}
+
+func cmdZREM(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) < 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zrem' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "zset" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	mems := make([]string, len(args)-1)
+	for i, a := range args[1:] {
+		mems[i] = a.Str
+	}
+	removed := st.ZSets.ZRem(key, mems)
+	return resp.IntegerValue(int64(removed))
+}
+
+func cmdZCARD(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zcard' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "zset" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	return resp.IntegerValue(int64(st.ZSets.ZCard(key)))
+}
+
+func cmdZSCORE(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zscore' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "zset" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	member := args[1].Str
+	score, ok := st.ZSets.ZScore(key, member)
+	if !ok {
+		return resp.NullValue()
+	}
+	return resp.BulkStringValue(fmt.Sprintf("%g", score))
+}
+
+func cmdZRANK(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zrank' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "zset" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	member := args[1].Str
+	rank, ok := st.ZSets.ZRank(key, member)
+	if !ok {
+		return resp.NullValue()
+	}
+	return resp.IntegerValue(int64(rank))
+}
+
+func cmdZREVRANGE(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) < 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zrevrange' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "zset" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	start, err := strconv.Atoi(args[1].Str)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	stop, err := strconv.Atoi(args[2].Str)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	withScores := false
+	if len(args) == 4 && strings.ToUpper(args[3].Str) == "WITHSCORES" {
+		withScores = true
+	}
+	elements := st.ZSets.ZRevRange(key, start, stop)
+	var res []resp.Value
+	for _, e := range elements {
+		res = append(res, resp.BulkStringValue(e.Member))
+		if withScores {
+			res = append(res, resp.BulkStringValue(fmt.Sprintf("%g", e.Score)))
+		}
+	}
+	return resp.ArrayValue(res)
+}
+
+func cmdZREVRANK(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zrevrank' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "zset" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	member := args[1].Str
+	rank, ok := st.ZSets.ZRevRank(key, member)
+	if !ok {
+		return resp.NullValue()
+	}
+	return resp.IntegerValue(int64(rank))
+}
+
+func cmdZCOUNT(st *store.Store, args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zcount' command")
+	}
+	key := args[0].Str
+	if t := st.KeyType(key); t != "none" && t != "zset" {
+		return resp.ErrorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	min, err := strconv.ParseFloat(args[1].Str, 64)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not a valid float")
+	}
+	max, err := strconv.ParseFloat(args[2].Str, 64)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not a valid float")
+	}
+	return resp.IntegerValue(int64(st.ZSets.ZCount(key, min, max)))
+}
+
+// ───────────────────────── Pub/Sub Commands ─────────────────────────
+
+func (r *Router) cmdSubscribe(p *Peer, args []resp.Value) resp.Value {
+	if p == nil {
+		return resp.ErrorValue("ERR SUBSCRIBE only active in connection context")
+	}
+	if len(args) < 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'subscribe' command")
+	}
+	channels := make([]string, len(args))
+	for i, a := range args {
+		channels[i] = a.Str
+	}
+	r.server.Subscribe(p, channels)
+	return resp.Value{}
+}
+
+func (r *Router) cmdUnsubscribe(p *Peer, args []resp.Value) resp.Value {
+	if p == nil {
+		return resp.ErrorValue("ERR UNSUBSCRIBE only active in connection context")
+	}
+	channels := make([]string, len(args))
+	for i, a := range args {
+		channels[i] = a.Str
+	}
+	r.server.Unsubscribe(p, channels)
+	return resp.Value{}
+}
+
+func (r *Router) cmdPSubscribe(p *Peer, args []resp.Value) resp.Value {
+	if p == nil {
+		return resp.ErrorValue("ERR PSUBSCRIBE only active in connection context")
+	}
+	if len(args) < 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'psubscribe' command")
+	}
+	patterns := make([]string, len(args))
+	for i, a := range args {
+		patterns[i] = a.Str
+	}
+	r.server.PSubscribe(p, patterns)
+	return resp.Value{}
+}
+
+func (r *Router) cmdPUnsubscribe(p *Peer, args []resp.Value) resp.Value {
+	if p == nil {
+		return resp.ErrorValue("ERR PUNSUBSCRIBE only active in connection context")
+	}
+	patterns := make([]string, len(args))
+	for i, a := range args {
+		patterns[i] = a.Str
+	}
+	r.server.PUnsubscribe(p, patterns)
+	return resp.Value{}
+}
+
+func (r *Router) cmdPublish(p *Peer, args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'publish' command")
+	}
+	channel := args[0].Str
+	message := args[1].Str
+	n := r.server.Publish(channel, message)
+	return resp.IntegerValue(int64(n))
+}
+
+// ───────────────────────── Transactions Commands ─────────────────────────
+
+func (r *Router) cmdMulti(p *Peer, args []resp.Value) resp.Value {
+	if p == nil {
+		return resp.ErrorValue("ERR MULTI only active in connection context")
+	}
+	if p.inTx {
+		return resp.ErrorValue("ERR MULTI calls can not be nested")
+	}
+	p.inTx = true
+	p.txQueue = nil
+	return resp.SimpleStringValue("OK")
+}
+
+func (r *Router) cmdDiscard(p *Peer, args []resp.Value) resp.Value {
+	if p == nil {
+		return resp.ErrorValue("ERR DISCARD only active in connection context")
+	}
+	if !p.inTx {
+		return resp.ErrorValue("ERR DISCARD without MULTI")
+	}
+	p.inTx = false
+	p.txQueue = nil
+	return resp.SimpleStringValue("OK")
+}
+
+func (r *Router) cmdExec(p *Peer, args []resp.Value) resp.Value {
+	if p == nil {
+		return resp.ErrorValue("ERR EXEC only active in connection context")
+	}
+	if !p.inTx {
+		return resp.ErrorValue("ERR EXEC without MULTI")
+	}
+
+	queue := p.txQueue
+	p.inTx = false
+	p.txQueue = nil
+
+	if len(queue) == 0 {
+		return resp.ArrayValue([]resp.Value{})
+	}
+
+	results := make([]resp.Value, len(queue))
+	for i, cmdArgs := range queue {
+		results[i] = r.Dispatch(p, cmdArgs)
+	}
+
+	return resp.ArrayValue(results)
+}
+
 // ───────────────────────── Key / Utility Commands ─────────────────────────
 
-// cmdDel handles DEL key [key ...]
-func (r *Router) cmdDel(args []resp.Value) resp.Value {
+func (r *Router) cmdDel(p *Peer, args []resp.Value) resp.Value {
 	if len(args) < 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'del' command")
 	}
@@ -838,8 +1621,7 @@ func (r *Router) cmdDel(args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(deleted))
 }
 
-// cmdExists handles EXISTS key [key ...]
-func (r *Router) cmdExists(args []resp.Value) resp.Value {
+func (r *Router) cmdExists(p *Peer, args []resp.Value) resp.Value {
 	if len(args) < 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'exists' command")
 	}
@@ -852,8 +1634,7 @@ func (r *Router) cmdExists(args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(count))
 }
 
-// cmdExpire handles EXPIRE key seconds
-func (r *Router) cmdExpire(args []resp.Value) resp.Value {
+func (r *Router) cmdExpire(p *Peer, args []resp.Value) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'expire' command")
 	}
@@ -869,8 +1650,7 @@ func (r *Router) cmdExpire(args []resp.Value) resp.Value {
 	return resp.IntegerValue(1)
 }
 
-// cmdExpireAt handles EXPIREAT key timestamp
-func (r *Router) cmdExpireAt(args []resp.Value) resp.Value {
+func (r *Router) cmdExpireAt(p *Peer, args []resp.Value) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'expireat' command")
 	}
@@ -886,8 +1666,7 @@ func (r *Router) cmdExpireAt(args []resp.Value) resp.Value {
 	return resp.IntegerValue(1)
 }
 
-// cmdTTL handles TTL key
-func (r *Router) cmdTTL(args []resp.Value) resp.Value {
+func (r *Router) cmdTTL(p *Peer, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'ttl' command")
 	}
@@ -898,8 +1677,7 @@ func (r *Router) cmdTTL(args []resp.Value) resp.Value {
 	return resp.IntegerValue(r.server.store.TTL.GetTTL(key))
 }
 
-// cmdPersist handles PERSIST key
-func (r *Router) cmdPersist(args []resp.Value) resp.Value {
+func (r *Router) cmdPersist(p *Peer, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'persist' command")
 	}
@@ -909,16 +1687,14 @@ func (r *Router) cmdPersist(args []resp.Value) resp.Value {
 	return resp.IntegerValue(0)
 }
 
-// cmdType handles TYPE key
-func (r *Router) cmdType(args []resp.Value) resp.Value {
+func (r *Router) cmdType(p *Peer, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'type' command")
 	}
 	return resp.SimpleStringValue(r.server.store.KeyType(args[0].Str))
 }
 
-// cmdRename handles RENAME key newkey
-func (r *Router) cmdRename(args []resp.Value) resp.Value {
+func (r *Router) cmdRename(p *Peer, args []resp.Value) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'rename' command")
 	}
@@ -928,15 +1704,13 @@ func (r *Router) cmdRename(args []resp.Value) resp.Value {
 	return resp.SimpleStringValue("OK")
 }
 
-// cmdKeys handles KEYS pattern (currently supports only *)
-func (r *Router) cmdKeys(args []resp.Value) resp.Value {
+func (r *Router) cmdKeys(p *Peer, args []resp.Value) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'keys' command")
 	}
 	pattern := args[0].Str
 	allKeys := r.server.store.AllKeys()
 
-	// Filter by glob pattern
 	var matched []string
 	for _, key := range allKeys {
 		if matchGlob(pattern, key) {
@@ -951,8 +1725,7 @@ func (r *Router) cmdKeys(args []resp.Value) resp.Value {
 	return resp.ArrayValue(result)
 }
 
-// cmdRandomKey handles RANDOMKEY
-func (r *Router) cmdRandomKey(args []resp.Value) resp.Value {
+func (r *Router) cmdRandomKey(p *Peer, args []resp.Value) resp.Value {
 	key := r.server.RandomKey()
 	if key == "" {
 		return resp.NullValue()
@@ -960,28 +1733,136 @@ func (r *Router) cmdRandomKey(args []resp.Value) resp.Value {
 	return resp.BulkStringValue(key)
 }
 
-// cmdDBSize handles DBSIZE
-func (r *Router) cmdDBSize(args []resp.Value) resp.Value {
+func (r *Router) cmdDBSize(p *Peer, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(r.server.store.DBSize()))
 }
 
-// cmdFlushDB handles FLUSHDB
-func (r *Router) cmdFlushDB(args []resp.Value) resp.Value {
+func (r *Router) cmdFlushDB(p *Peer, args []resp.Value) resp.Value {
 	r.server.store.FlushDB()
 	return resp.SimpleStringValue("OK")
 }
 
-// cmdInfo handles INFO [section]
-func (r *Router) cmdInfo(args []resp.Value) resp.Value {
+func (r *Router) cmdInfo(p *Peer, args []resp.Value) resp.Value {
 	return resp.BulkStringValue(r.server.Info())
 }
 
-// cmdBGSave handles BGSAVE — flushes the AOF buffer and fsyncs to disk.
-func (r *Router) cmdBGSave(args []resp.Value) resp.Value {
+func (r *Router) cmdBGSave(p *Peer, args []resp.Value) resp.Value {
 	if err := r.server.SyncAOF(); err != nil {
 		return resp.ErrorValue("ERR " + err.Error())
 	}
 	return resp.SimpleStringValue("Background saving started")
+}
+
+func (r *Router) cmdBGRewriteAOF(p *Peer, args []resp.Value) resp.Value {
+	if err := r.server.BGRewriteAOF(); err != nil {
+		return resp.ErrorValue("ERR " + err.Error())
+	}
+	return resp.SimpleStringValue("Background append only file rewriting started")
+}
+
+func (r *Router) cmdScan(p *Peer, args []resp.Value) resp.Value {
+	if len(args) < 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'scan' command")
+	}
+	keys := r.server.store.AllKeys()
+	var matchPattern string
+	for i := 1; i < len(args); i++ {
+		flag := strings.ToUpper(args[i].Str)
+		if flag == "MATCH" && i+1 < len(args) {
+			matchPattern = args[i+1].Str
+			i++
+		} else if flag == "COUNT" && i+1 < len(args) {
+			i++
+		}
+	}
+	var matched []resp.Value
+	for _, k := range keys {
+		if matchPattern == "" || matchGlob(matchPattern, k) {
+			matched = append(matched, resp.BulkStringValue(k))
+		}
+	}
+	return resp.ArrayValue([]resp.Value{
+		resp.BulkStringValue("0"),
+		resp.ArrayValue(matched),
+	})
+}
+
+func (r *Router) cmdPTTL(p *Peer, args []resp.Value) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'pttl' command")
+	}
+	key := args[0].Str
+	if !r.server.store.KeyExists(key) {
+		return resp.IntegerValue(-2)
+	}
+	deadline, ok := r.server.store.TTL.GetDeadline(key)
+	if !ok {
+		return resp.IntegerValue(-1)
+	}
+	remaining := deadline - time.Now().UnixMilli()
+	if remaining < 0 {
+		return resp.IntegerValue(0)
+	}
+	return resp.IntegerValue(remaining)
+}
+
+func (r *Router) cmdPExpire(p *Peer, args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'pexpire' command")
+	}
+	key := args[0].Str
+	if !r.server.store.KeyExists(key) {
+		return resp.IntegerValue(0)
+	}
+	ms, err := strconv.ParseInt(args[1].Str, 10, 64)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	r.server.store.TTL.SetDeadline(key, time.Now().UnixMilli()+ms)
+	return resp.IntegerValue(1)
+}
+
+func (r *Router) cmdPExpireAt(p *Peer, args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'pexpireat' command")
+	}
+	key := args[0].Str
+	if !r.server.store.KeyExists(key) {
+		return resp.IntegerValue(0)
+	}
+	ts, err := strconv.ParseInt(args[1].Str, 10, 64)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	r.server.store.TTL.SetDeadline(key, ts)
+	return resp.IntegerValue(1)
+}
+
+func (r *Router) cmdUnlink(p *Peer, args []resp.Value) resp.Value {
+	if len(args) < 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'unlink' command")
+	}
+	deleted := 0
+	for _, a := range args {
+		if r.server.store.DeleteKey(a.Str) {
+			deleted++
+		}
+	}
+	return resp.IntegerValue(int64(deleted))
+}
+
+func (r *Router) cmdTouch(p *Peer, args []resp.Value) resp.Value {
+	if len(args) < 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'touch' command")
+	}
+	touched := 0
+	for _, a := range args {
+		if r.server.store.KeyExists(a.Str) {
+			r.server.store.Touch(a.Str)
+			touched++
+		}
+	}
+	return resp.IntegerValue(int64(touched))
 }
 
 // matchGlob implements a simple glob pattern matcher supporting * and ?.
@@ -993,7 +1874,6 @@ func matchGlobHelper(pattern, str string, pi, si int) bool {
 	for pi < len(pattern) && si < len(str) {
 		switch pattern[pi] {
 		case '*':
-			// Try matching * with 0 or more characters
 			for si <= len(str) {
 				if matchGlobHelper(pattern, str, pi+1, si) {
 					return true
@@ -1005,7 +1885,6 @@ func matchGlobHelper(pattern, str string, pi, si int) bool {
 			pi++
 			si++
 		case '[':
-			// Find closing bracket
 			end := strings.IndexByte(pattern[pi:], ']')
 			if end == -1 {
 				return false
@@ -1034,13 +1913,9 @@ func matchGlobHelper(pattern, str string, pi, si int) bool {
 		}
 	}
 
-	// Consume trailing *
 	for pi < len(pattern) && pattern[pi] == '*' {
 		pi++
 	}
 
 	return pi == len(pattern) && si == len(str)
 }
-
-// Suppress unused import warning
-var _ = filepath.Base
