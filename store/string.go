@@ -5,28 +5,24 @@ import (
 	"sync"
 )
 
-// StringStore manages string key-value pairs with its own read-write mutex
-// for concurrent access. It is the backing store for Redis string commands.
+// StringStore handles basic string key-value pairs with RWMutex concurrency control.
 type StringStore struct {
 	mu   sync.RWMutex
 	data map[string]string
 }
 
-// NewStringStore creates a new empty StringStore.
 func NewStringStore() *StringStore {
 	return &StringStore{
 		data: make(map[string]string),
 	}
 }
 
-// Set stores a string value for the given key, overwriting any previous value.
 func (s *StringStore) Set(key, value string) {
 	s.mu.Lock()
 	s.data[key] = value
 	s.mu.Unlock()
 }
 
-// SetNX sets the key only if it does not already exist. Returns true if set.
 func (s *StringStore) SetNX(key, value string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -37,7 +33,6 @@ func (s *StringStore) SetNX(key, value string) bool {
 	return true
 }
 
-// SetXX sets the key only if it already exists. Returns true if set.
 func (s *StringStore) SetXX(key, value string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -115,9 +110,8 @@ func (s *StringStore) MGet(keys []string) []interface{} {
 	return result
 }
 
-// IncrBy increments the integer value stored at key by delta.
-// If the key does not exist, it is set to 0 before incrementing.
-// Returns the new value and an error if the stored value is not an integer.
+// Increments integer stored at key by delta (creates key at 0 if missing).
+// TODO: implement INCRBYFLOAT for floating point values
 func (s *StringStore) IncrBy(key string, delta int64) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

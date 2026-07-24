@@ -68,35 +68,13 @@ type Value struct {
 	Array []Value // populated for Array
 }
 
-// BulkStringValue creates a new BulkString Value with the given string.
-func BulkStringValue(s string) Value {
-	return Value{Typ: BulkString, Str: s}
-}
-
-// SimpleStringValue creates a new SimpleString Value with the given string.
-func SimpleStringValue(s string) Value {
-	return Value{Typ: SimpleString, Str: s}
-}
-
-// ErrorValue creates a new Error Value with the given message.
-func ErrorValue(msg string) Value {
-	return Value{Typ: Error, Str: msg}
-}
-
-// IntegerValue creates a new Integer Value with the given number.
-func IntegerValue(n int64) Value {
-	return Value{Typ: Integer, Num: n}
-}
-
-// NullValue creates a new Null Value.
-func NullValue() Value {
-	return Value{Typ: Null}
-}
-
-// ArrayValue creates a new Array Value with the given elements.
-func ArrayValue(elems []Value) Value {
-	return Value{Typ: Array, Array: elems}
-}
+// Helper constructors for constructing Value types
+func BulkStringValue(s string) Value  { return Value{Typ: BulkString, Str: s} }
+func SimpleStringValue(s string) Value { return Value{Typ: SimpleString, Str: s} }
+func ErrorValue(msg string) Value      { return Value{Typ: Error, Str: msg} }
+func IntegerValue(n int64) Value       { return Value{Typ: Integer, Num: n} }
+func NullValue() Value                 { return Value{Typ: Null} }
+func ArrayValue(elems []Value) Value   { return Value{Typ: Array, Array: elems} }
 
 // Common RESP error prefixes.
 var (

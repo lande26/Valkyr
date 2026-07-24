@@ -208,7 +208,7 @@ func (r *Router) registerAll() {
 	r.handlers["TOUCH"] = r.cmdTouch
 }
 
-// ───────────────────────── Connection Commands ─────────────────────────
+// Connection commands
 
 func (r *Router) cmdPing(p *Peer, args []resp.Value) resp.Value {
 	if len(args) == 0 {
@@ -228,7 +228,7 @@ func (r *Router) cmdCommand(p *Peer, args []resp.Value) resp.Value {
 	return resp.SimpleStringValue("OK")
 }
 
-// ───────────────────────── Helpers for type-checked commands ─────────────────────────
+// Helper wrappers for store methods
 
 type stringCmdFunc func(st *store.Store, args []resp.Value) resp.Value
 type hashCmdFunc func(st *store.Store, args []resp.Value) resp.Value
@@ -266,7 +266,7 @@ func (r *Router) makeZSetCmd(st *store.Store, fn zsetCmdFunc) HandlerFunc {
 	}
 }
 
-// ───────────────────────── String Commands ─────────────────────────
+// String handlers
 
 func cmdSET(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
@@ -617,7 +617,7 @@ func cmdMSETNX(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(1)
 }
 
-// ───────────────────────── Hash Commands ─────────────────────────
+// Hash handlers
 
 func cmdHSET(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 3 || len(args[1:])%2 != 0 {
@@ -853,7 +853,7 @@ func cmdHSTRLEN(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(st.Hashes.HStrLen(key, field)))
 }
 
-// ───────────────────────── List Commands ─────────────────────────
+// List handlers
 
 func cmdLPUSH(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
@@ -1067,7 +1067,7 @@ func cmdRPOPLPUSH(st *store.Store, args []resp.Value) resp.Value {
 	return resp.BulkStringValue(val)
 }
 
-// ───────────────────────── Set Commands ─────────────────────────
+// Set handlers
 
 func cmdSADD(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
@@ -1310,7 +1310,7 @@ func cmdSSCAN(st *store.Store, args []resp.Value) resp.Value {
 	})
 }
 
-// ───────────────────────── Sorted Set Commands ─────────────────────────
+// Sorted Set handlers
 
 func cmdZADD(st *store.Store, args []resp.Value) resp.Value {
 	if len(args) < 3 || len(args[1:])%2 != 0 {
@@ -1490,7 +1490,7 @@ func cmdZCOUNT(st *store.Store, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(st.ZSets.ZCount(key, min, max)))
 }
 
-// ───────────────────────── Pub/Sub Commands ─────────────────────────
+// Pub/Sub handlers
 
 func (r *Router) cmdSubscribe(p *Peer, args []resp.Value) resp.Value {
 	if p == nil {
@@ -1556,7 +1556,7 @@ func (r *Router) cmdPublish(p *Peer, args []resp.Value) resp.Value {
 	return resp.IntegerValue(int64(n))
 }
 
-// ───────────────────────── Transactions Commands ─────────────────────────
+// Transaction handlers
 
 func (r *Router) cmdMulti(p *Peer, args []resp.Value) resp.Value {
 	if p == nil {
@@ -1606,7 +1606,7 @@ func (r *Router) cmdExec(p *Peer, args []resp.Value) resp.Value {
 	return resp.ArrayValue(results)
 }
 
-// ───────────────────────── Key / Utility Commands ─────────────────────────
+// Key management & utility handlers
 
 func (r *Router) cmdDel(p *Peer, args []resp.Value) resp.Value {
 	if len(args) < 1 {

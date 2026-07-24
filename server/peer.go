@@ -73,7 +73,7 @@ func (p *Peer) ReadLoop() {
 
 		cmd := strings.ToUpper(args[0].Str)
 
-		// 1. Pub/Sub check
+		// Only allow pub/sub commands when client is subscribed to a channel
 		p.subMu.Lock()
 		isSubscribed := len(p.subscribedChannels) > 0 || len(p.subscribedPatterns) > 0
 		p.subMu.Unlock()
@@ -81,7 +81,7 @@ func (p *Peer) ReadLoop() {
 		if isSubscribed {
 			switch cmd {
 			case "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PING", "QUIT":
-				// allowed
+				// allowed in pub/sub mode
 			default:
 				errVal := resp.ErrorValue("ERR only SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PING, QUIT are allowed in this context")
 				if err := p.WriteAndFlush(errVal); err != nil {
@@ -91,9 +91,8 @@ func (p *Peer) ReadLoop() {
 			}
 		}
 
-		// 2. Transaction Check
+		// Transaction queuing mode (between MULTI and EXEC/DISCARD)
 		if p.inTx && cmd != "EXEC" && cmd != "DISCARD" && cmd != "MULTI" {
-			// Check if command exists
 			if !p.server.router.HasHandler(cmd) {
 				errVal := resp.ErrorValue("ERR unknown command '" + cmd + "'")
 				if err := p.WriteAndFlush(errVal); err != nil {
@@ -101,7 +100,6 @@ func (p *Peer) ReadLoop() {
 				}
 				continue
 			}
-			// Queue command
 			p.txQueue = append(p.txQueue, args)
 			queuedVal := resp.SimpleStringValue("QUEUED")
 			if err := p.WriteAndFlush(queuedVal); err != nil {

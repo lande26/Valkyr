@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+// Skip list configuration parameters modeled after Redis sorted sets (t_zset.c).
+// Max level 32 supports up to 2^64 elements efficiently.
 const zsetMaxLevel = 32
 const zsetP = 0.25
 
