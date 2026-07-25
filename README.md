@@ -1,4 +1,4 @@
-# Valkyr ⚡
+# Valkyr 🐺
 
 Valkyr is a production-grade, highly concurrent Redis clone written in Go. It implements the **Redis Serialization Protocol (RESP2)** and supports key Redis features like Transactions, Pub/Sub, AOF persistence with background rewrite (compaction), Sorted Sets (ZSets), and memory limits with LRU/LFU eviction.
 
